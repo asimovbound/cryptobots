@@ -1,0 +1,123 @@
+import express, { type Request, Response, NextFunction } from "express";
+import { registerRoutes } from "./routes";
+import { setupVite, serveStatic, log } from "./vite";
+
+const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: false }));
+
+app.use((req, res, next) => {
+  const start = Date.now();
+  const path = req.path;
+  let capturedJsonResponse: Record<string, any> | undefined = undefined;
+
+  const originalResJson = res.json;
+  res.json = function (bodyJson, ...args) {
+    capturedJsonResponse = bodyJson;
+    return originalResJson.apply(res, [bodyJson, ...args]);
+  };
+
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (path.startsWith("/api")) {
+      let logLine = `${req.method} ${path} ${res.statusCode} in ${duration}ms`;
+      if (capturedJsonResponse) {
+        logLine += ` :: ${JSON.stringify(capturedJsonResponse)}`;
+      }
+
+      if (logLine.length > 80) {
+        logLine = logLine.slice(0, 79) + "…";
+      }
+
+      log(logLine);
+    }
+  });
+
+  next();
+});
+
+(async () => {
+  // Run database schema migrations before setting up routes
+  try {
+    log("Running database schema migrations");
+    
+    // Run trading pairs schema migration
+    const { migrateTradingPairsSchema } = await import("./migrateSchema");
+    await migrateTradingPairsSchema();
+    
+    // Run backtest history schema migration
+    const { migrateBacktestHistorySchema } = await import("./migrateBacktestHistory");
+    await migrateBacktestHistorySchema();
+    
+    // Run default strategies migration
+    const { runDefaultStrategiesMigration } = await import("./migrateDefaultStrategies");
+    await runDefaultStrategiesMigration();
+    
+    log("Database migrations completed successfully");
+  } catch (migrationError) {
+    console.error("Error running database migrations:", migrationError);
+  }
+
+  const server = await registerRoutes(app);
+
+  app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
+    const status = err.status || err.statusCode || 500;
+    const message = err.message || "Internal Server Error";
+
+    res.status(status).json({ message });
+    throw err;
+  });
+
+  // Set up scheduled job for refreshing trading pairs
+  try {
+    // Daily refresh of all trading pairs
+    const tradingPairRefreshInterval = 24 * 60 * 60 * 1000; // 24 hours in milliseconds
+    log(`Setting up scheduled job to refresh trading pairs every ${tradingPairRefreshInterval / (60 * 60 * 1000)} hours`);
+    
+    // Initial delay of 5 minutes after server start to allow everything to initialize
+    setTimeout(async () => {
+      try {
+        const { tradingPairService } = await import("./tradingPairService");
+        
+        // Run the first refresh
+        log("Running initial trading pairs refresh for all exchanges...");
+        await tradingPairService.refreshAllExchanges();
+        
+        // Set up recurring job
+        setInterval(async () => {
+          try {
+            log("Running scheduled trading pairs refresh for all exchanges...");
+            await tradingPairService.refreshAllExchanges();
+          } catch (error) {
+            console.error("Error in scheduled trading pairs refresh:", error);
+          }
+        }, tradingPairRefreshInterval);
+      } catch (error) {
+        console.error("Error setting up trading pair refresh job:", error);
+      }
+    }, 5 * 60 * 1000); // 5 minute initial delay
+  } catch (error) {
+    console.error("Error setting up scheduled jobs:", error);
+  }
+
+  // importantly only setup vite in development and after
+  // setting up all the other routes so the catch-all route
+  // doesn't interfere with the other routes
+  if (app.get("env") === "development") {
+    await setupVite(app, server);
+  } else {
+    serveStatic(app);
+  }
+
+  // ALWAYS serve the app on port 5000
+  // this serves both the API and the client.
+  // It is the only port that is not firewalled.
+  const port = 5000;
+  server.listen({
+    port,
+    host: "0.0.0.0",
+    reusePort: true,
+  }, () => {
+    log(`serving on port ${port}`);
+  });
+})();

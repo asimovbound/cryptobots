@@ -1,0 +1,24 @@
+        // Get current price from the exchange ticker if possible
+        let executionPrice = price;
+        if (!executionPrice) {
+          try {
+            const currentPrice = await this.getCurrentPrice(symbol);
+            if (currentPrice) {
+              executionPrice = currentPrice;
+              console.log(`Got price from current price API: ${executionPrice}`);
+            } else {
+              const ccxtExchange = await this.initCcxtExchange(exchange);
+              if (ccxtExchange.has['fetchTicker']) {
+                const ticker = await ccxtExchange.fetchTicker(symbol);
+                executionPrice = type === 'buy' ? ticker.ask : ticker.bid;
+                console.log(`Got price from ticker: ${executionPrice}`);
+              }
+            }
+          } catch (priceError) {
+            // If we can't get the real price, use our base price
+            console.error('Error getting price from exchange:', priceError);
+          }
+        }
+        
+        // Use base price as fallback
+        executionPrice = executionPrice || this.getBasePrice(symbol) || 0;
